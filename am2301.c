@@ -33,9 +33,10 @@
 #include <linux/irqflags.h>
 #include <linux/spinlock.h>
 
-// GPIO pin for input and output, GPIO24 
-// note that physical connector pin number is different
-static int gpio = 24;
+#define MAX_SENS 5
+
+static int gpios[MAX_SENS]; 
+static int gpio_count;
 
 // last measurement time, next measurement can not be done
 // until measurement period has passed (see MEASUREMENT_PERIOD)
@@ -59,7 +60,7 @@ static long last_time = 0;
  * 
  * returns 0 if changed successfully, 1 if no change
  */
-int wait_for_gpio(int state) 
+int wait_for_gpio(int gpio, int state) 
 {
 	int i;
 
@@ -75,94 +76,102 @@ int wait_for_gpio(int state)
 }
 
 static int am2301_show(struct seq_file *m, void *v)
-{
+{	
 	int i, res;
 	int databyte = 0L;
 	int d = 0, b = 0;
-	char status[20];
-	int data[5];
-	int rh,t;
+	char status[MAX_SENS][20];
+	int data[MAX_SENS][5];
+	int rh[MAX_SENS],t[MAX_SENS];
+	int gpio;
+	int j;
 
 	ktime_t start, stop;
 	int nodata_error = 0; // 1 if no data from AM2301
 
-        gpio_direction_output(gpio, 1);
+	for(j = 0; j<gpio_count; j++) {
 
-        udelay(2000);
+		databyte = 0L;
+		d = 0;
+		b = 0;
 
-        /*
-         * Set pin low and wait for at least 800 us.
-         * Set it high again, then wait for the sensor to put out a low pulse.
-         */
-        gpio_set_value(gpio, 0);
-        udelay(1000);
+		gpio = gpios[j];
+		gpio_direction_output(gpio, 1);
 
-	// Disable interrupts during measurement, this is critical for 
-	// reliable time measurements when receiving high speed data.
-	// All Kernel interrupts are disabled for about 2-3 milliseconds.
+		udelay(2000);
 
-	local_irq_disable();
+		/*
+		 * Set pin low and wait for at least 800 us.
+		 * Set it high again, then wait for the sensor to put out a low pulse.
+		 */
+		gpio_set_value(gpio, 0);
+		udelay(1000);
 
-        gpio_set_value(gpio, 1);
+		// Disable interrupts during measurement, this is critical for 
+		// reliable time measurements when receiving high speed data.
+		// All Kernel interrupts are disabled for about 2-3 milliseconds.
 
-	gpio_direction_input(gpio);
+		local_irq_disable();
 
-	nodata_error |= wait_for_gpio(LOW);
-	nodata_error |= wait_for_gpio(HIGH);
-	nodata_error |= wait_for_gpio(LOW);
- 			
-	
-	for ( i=0; i<40; i++) {
-		wait_for_gpio(HIGH);
+		gpio_set_value(gpio, 1);
+
+		gpio_direction_input(gpio);
+
+		nodata_error |= wait_for_gpio(gpio, LOW);
+		nodata_error |= wait_for_gpio(gpio, HIGH);
+		nodata_error |= wait_for_gpio(gpio, LOW);
+				
 		
-		// now measure length of high state in nanoseconds
+		for ( i=0; i<40; i++) {
+			wait_for_gpio(gpio, HIGH);
+			
+			// now measure length of high state in nanoseconds
+			start = ktime_get_real();
+			wait_for_gpio(gpio, LOW);
+			stop = ktime_get_real();
+			res = (int)(stop.tv64 - start.tv64);
 
-		start = ktime_get_real();
-		wait_for_gpio(LOW);
-		stop = ktime_get_real();
-		res = (int)(stop.tv64 - start.tv64);
+			// 1st data bit is shorter, why ? 
 
-		// 1st data bit is shorter, why ? 
-
-		if ((i==0 && res > 29000) || ( i!=0 && res > 40000)) {
-			databyte|=0x01;
-		} 
-		d++;
-		if (d==8) {
-			d=0;
-			data[b]=databyte;
-		b=b+1;
-		databyte=0x00;
-	}
-	databyte<<=1;		
-}
-
-local_irq_enable();
-wait_for_gpio(HIGH);
-
-        gpio_direction_output(gpio, 1);
-	
-	if (((data[0] + data[1] + data[2] + data[3]) & 0xff) == data[4]) {
-		strcpy(status, "ok");
-	} else  {
-		strcpy(status, "error, checksum");
-	}
-	if (nodata_error) {
-		strcpy(status, "error, no data");
+			if ((i==0 && res > 29000) || ( i!=0 && res > 40000)) {
+				databyte|=0x01;
+			} 
+			d++;
+			if (d==8) {
+				d=0;
+				data[j][b]=databyte;
+			b=b+1;
+			databyte=0x00;
+		}
+		databyte<<=1;		
 	}
 
-	// check flag for negative temperatures
-	rh = ((data[0]<<8) + data[1] );
+	local_irq_enable();
+	wait_for_gpio(gpio, HIGH);
 
-	if (data[2] & 0x80) {
-		data[2] = data[2] & 0x7f;
-		t  = (data[2]<<8) + data[3];
-		seq_printf(m, "%d.%d RH, -%d.%d C, %s\n", rh/10, rh%10, t/10, t%10, status);
-	} else {
-		t = (data[2]<<8) + data[3];
-		seq_printf(m, "%d.%d RH, %d.%d C, %s\n", rh/10, rh%10, t/10, t%10, status);
+		gpio_direction_output(gpio, 1);
+		
+		if (((data[j][0] + data[j][1] + data[j][2] + data[j][3]) & 0xff) == data[j][4]) {
+			strcpy(status[j], "ok");
+		} else  {
+			strcpy(status[j], "error, checksum");
+		}
+		if (nodata_error) {
+			strcpy(status[j], "error, no data");
+		}
+
+		// check flag for negative temperatures
+		rh[j] = ((data[j][0]<<8) + data[j][1] );
+
+		if (data[j][2] & 0x80) {
+			data[j][2] = data[j][2] & 0x7f;
+			t[j]  = (data[j][2]<<8) + data[j][3];
+			seq_printf(m, "GPIO Port %i, %d.%d RH, -%d.%d C, %s\n", gpio, rh[j]/10, rh[j]%10, t[j]/10, t[j]%10, status[j]);
+		} else {
+			t[j] = (data[j][2]<<8) + data[j][3];
+			seq_printf(m, "GPIO Port %i, %d.%d RH, %d.%d C, %s\n", gpio, rh[j]/10, rh[j]%10, t[j]/10, t[j]%10, status[j]);
+		}
 	}
-
         return 0;
 }
 
@@ -192,13 +201,19 @@ static const struct file_operations am2301_fops =
 
 static int __init am2301_init(void)
 {
-	int ret;
+	int ret, i, gpio;
 
 	printk(KERN_INFO "Initializing am2301 (dht21)\n");
-	printk(KERN_INFO "Using GPIO%d\n", gpio);
+	printk(KERN_INFO "Using GPIOS: ");
 
-	ret = gpio_request_one(gpio, GPIOF_OUT_INIT_HIGH, "AM2301");
+	for(i=0; i<gpio_count; i++) {
+		gpio = gpios[i];
+		printk(KERN_INFO "%i ", gpio);
+		ret = gpio_request_one(gpio, GPIOF_OUT_INIT_HIGH, "AM2301");
+	}
 
+	printk(KERN_INFO "\n");
+	
 	if (ret != 0) {
 		printk(KERN_ERR "Unable to request GPIO, err: %d\n", ret);
 		return ret;
@@ -210,14 +225,15 @@ static int __init am2301_init(void)
 
 static void __exit am2301_exit(void)
 {
- 	(void) gpio_direction_output(gpio, 1);
-	gpio_free(gpio);
-
+	int i, gpio;
+	for(i = 0; i < gpio_count; i++) {
+ 		gpio = gpios[i];
+		(void) gpio_direction_output(gpio, 1);
+		gpio_free(gpio);
+	}
 	remove_proc_entry("am2301", NULL);
 	printk(KERN_INFO "am2301 exit module\n");
 }
-
-
 
 
 module_init(am2301_init);
@@ -227,7 +243,7 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kari Aarnio");
 MODULE_DESCRIPTION("AM2301 (DHT21) driver");
 
-module_param(gpio, int, S_IRUGO);
+module_param_array(gpios, int, &gpio_count, S_IRUGO);
 
-MODULE_PARM_DESC(gpio, "Pin number for data input and output, assuming GPIO24 (Raspberry Model B physical pin #18)");
+MODULE_PARM_DESC(gpios, "Pin number for data input and output, assuming GPIO24 (Raspberry Model B physical pin #18)");
 
